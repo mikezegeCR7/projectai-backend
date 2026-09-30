@@ -1,0 +1,840 @@
+// Project AI — Prisma schema
+//
+// Source of truth: docs/DATABASE.md. This file is the DATABASE.md schema
+// with the following corrections made during pre-migration validation
+// (see ENGINEERING-RULES.md §3 "Validate relations before migrations"):
+//
+// 1. FIX: `Export` had a `documentId` scalar but no relation back to
+//    `Document`, while `Document.exports Export[]` expected one. Added
+//    `document Document @relation(...)`. Without this, `prisma validate`
+//    fails.
+// 2. ADD: `@@index([projectId])` on Note, Outline, Document, Reference,
+//    File, Export, Review — these are queried by project constantly and
+//    had no index in the original doc.
+// 3. INTENTIONAL, NOT A BUG: `Document.currentVersionId` is a bare scalar,
+//    not a `@relation`. DATABASE.md §32 flags Document ↔ DocumentVersion as
+//    a circular-relation risk to check. The real FK direction is
+//    DocumentVersion.documentId → Document (cascade delete). Making
+//    currentVersionId a second, opposite-direction relation would create
+//    a genuine cycle (you couldn't delete either row first). It stays an
+//    unenforced pointer, kept in sync by the service layer when a new
+//    version is generated. Do not "fix" this into a `@relation` later
+//    without redesigning the cascade direction.
+// 4. INTENTIONAL, NOT A BUG: `DocumentVersion.createdBy` is a bare String,
+//    not a relation to User, matching DATABASE.md's own field list. If a
+//    later slice needs an enforced FK here, that's a product decision to
+//    flag, not a silent schema change.
+//
+// Slice 2 (full-text retrieval) additions — per the locked Slice 2
+// decisions doc, not invented ad hoc:
+//
+// 5. ADD: `Source.provider` (new `SourceProvider` enum). Provider
+//    provenance (which discovery provider actually surfaced this source)
+//    was not persisted anywhere before — SourceCandidate.provider was
+//    computed and then silently dropped in ResearchRunProcessor. This is
+//    a genuinely new contract, flagged per the "identify proposed
+//    contracts explicitly" rule. Nullable because pre-Slice-2 Source
+//    rows (if any exist in a dev database already) won't have it; new
+//    rows always set it.
+// 6. CHANGE: `SourceDocument.extractionStatus` (a bare, unconstrained
+//    String) is replaced with `status SourceDocumentStatus`, matching
+//    the three locked semantics (COMPLETED / ABSTRACT_ONLY / FAILED,
+//    plus PENDING as the pre-attempt default). `storageKey`, `mimeType`,
+//    `fileSize`, `checksum` become optional — a FAILED or ABSTRACT_ONLY
+//    document has no retrieved binary to describe. `storageKey` itself
+//    is reserved for a future raw-file (Files/S3) slice and is unused by
+//    Slice 2 — full extracted text goes through the storage abstraction
+//    below instead, referenced by `textStorageKey`. New fields:
+//    `retrievedUrl` (the final URL after redirects — may differ from
+//    Source.url), `httpStatus`, `errorMessage` (why retrieval/extraction
+//    failed or fell back), `extractedAt`.
+// 7. ADD: `SourceDocumentText` — the Postgres-backed implementation of
+//    the SourceDocumentStorage abstraction (see
+//    infrastructure/content/). Deliberately NOT foreign-keyed to
+//    SourceDocument: the storage abstraction only ever deals in opaque
+//    string keys (by convention, the owning Source's id), so that
+//    swapping to S3/object storage later means adding a new
+//    implementation of the interface, not migrating this table or
+//    touching the research pipeline. Known limitation, explicitly
+//    flagged rather than silently accepted: rows here are only cleaned
+//    up when a ResearchRun's Sources are recreated on retry (see
+//    ResearchRunProcessor.persistSources); a Source removed by some
+//    other path (e.g. project deletion) does not currently cascade-clean
+//    its text row. Acceptable for Slice 2's scope; worth revisiting once
+//    a real storage-lifecycle/GC concern exists.
+//
+// 8. ADD: `ConflictEvidence`, mirroring ClaimEvidence. DATABASE.md sec. 20
+//    says conflicts "should preserve the relevant claims/evidence rather
+//    than silently resolving disagreement", but ResearchConflict had no
+//    link to Evidence at all, so a conflict could only be prose. This
+//    join table stores which Evidence rows a conflict is between. Links
+//    to Claim are NOT modelled: the doc's "claims/evidence" wording is
+//    ambiguous on whether conflicts should also reference claims, and
+//    that is left as an open question rather than guessed at.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ProjectType {
+  ACADEMIC
+  PROFESSIONAL
+  BUSINESS
+  OTHER
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ARCHIVED
+  COMPLETED
+}
+
+enum ResearchRunStatus {
+  QUEUED
+  RUNNING
+  PAUSED
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum SourceType {
+  JOURNAL_ARTICLE
+  BOOK
+  BOOK_CHAPTER
+  CONFERENCE_PAPER
+  GOVERNMENT_REPORT
+  OFFICIAL_DOCUMENT
+  WEBSITE
+  NEWS
+  THESIS
+  DISSERTATION
+  DATASET
+  OTHER
+}
+
+enum SourceEvaluationStatus {
+  PENDING
+  EVALUATED
+  ACCEPTED
+  REJECTED
+  NEEDS_REVIEW
+}
+
+// Which discovery provider surfaced this Source. See schema header note 5.
+enum SourceProvider {
+  TAVILY
+  SEMANTIC_SCHOLAR
+}
+
+// See schema header note 6 and the locked Slice 2 decisions doc.
+// PENDING: not yet attempted (default; in practice rows are usually
+//   created already-resolved, since retrieval runs synchronously within
+//   the research-run job — PENDING mainly guards against a row existing
+//   mid-write).
+// COMPLETED: full text was retrieved and extracted.
+// ABSTRACT_ONLY: no full text reachable, but a usable abstract exists.
+//   Only ever set for academic (Semantic Scholar) sources — see
+//   SourceDocumentService.
+// FAILED: no usable text at all. The Source itself is preserved; only
+//   the SourceDocument records the failure.
+enum SourceDocumentStatus {
+  PENDING
+  COMPLETED
+  ABSTRACT_ONLY
+  FAILED
+}
+
+enum EvidenceType {
+  FINDING
+  STATISTIC
+  DEFINITION
+  METHOD
+  QUOTE
+  OBSERVATION
+  CONCLUSION
+  OTHER
+}
+
+enum ClaimStatus {
+  SUPPORTED
+  PARTIALLY_SUPPORTED
+  UNSUPPORTED
+  CONFLICTED
+  NEEDS_REVIEW
+}
+
+enum ClaimEvidenceRelationship {
+  SUPPORTS
+  QUALIFIES
+  CONTRADICTS
+  CONTEXT
+}
+
+enum DocumentStatus {
+  DRAFT
+  GENERATING
+  READY
+  REVIEWING
+  COMPLETED
+}
+
+enum DocumentType {
+  RESEARCH_PAPER
+  FINAL_YEAR_PROJECT
+  ASSIGNMENT
+  REPORT
+  THESIS
+  DISSERTATION
+  PROPOSAL
+  LITERATURE_REVIEW
+  PRESENTATION
+  SUMMARY
+  OTHER
+}
+
+enum ReviewType {
+  RESEARCH_INTEGRITY
+  CITATION
+  REQUIREMENT
+  WRITING
+  FINAL
+}
+
+enum ReviewStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum FindingSeverity {
+  INFO
+  WARNING
+  ERROR
+}
+
+enum FindingStatus {
+  OPEN
+  RESOLVED
+  IGNORED
+}
+
+enum FileStatus {
+  UPLOADED
+  PROCESSING
+  READY
+  FAILED
+  DELETED
+}
+
+enum ExportFormat {
+  PDF
+  DOCX
+  MARKDOWN
+  PPTX
+}
+
+enum ExportStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  firstName       String?
+  lastName        String?
+  emailVerifiedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  sessions      Session[]
+  projects      Project[]
+  subscription  Subscription?
+  usageRecords  UsageRecord[]
+  notifications Notification[]
+  files         File[]
+}
+
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  ipAddress  String?
+  userAgent  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Plan {
+  id          String   @id @default(cuid())
+  name        String
+  code        String   @unique
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  subscriptions Subscription[]
+  entitlements  PlanEntitlement[]
+}
+
+model Entitlement {
+  id          String  @id @default(cuid())
+  code        String  @unique
+  description String?
+
+  plans PlanEntitlement[]
+}
+
+model PlanEntitlement {
+  planId        String
+  entitlementId String
+
+  plan        Plan        @relation(fields: [planId], references: [id], onDelete: Cascade)
+  entitlement Entitlement @relation(fields: [entitlementId], references: [id], onDelete: Cascade)
+
+  @@id([planId, entitlementId])
+}
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  userId                 String             @unique
+  planId                 String
+  status                 SubscriptionStatus
+  provider               String?
+  providerSubscriptionId String?
+  currentPeriodStart     DateTime?
+  currentPeriodEnd       DateTime?
+  cancelAtPeriodEnd      Boolean            @default(false)
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan Plan @relation(fields: [planId], references: [id])
+
+  @@index([planId])
+}
+
+model UsageRecord {
+  id        String   @id @default(cuid())
+  userId    String
+  projectId String?
+  operation String
+  quantity  Int
+  unit      String
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([projectId])
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  ownerId     String
+  name        String
+  description String?
+  type        ProjectType
+  status      ProjectStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  archivedAt  DateTime?
+
+  owner             User                @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  requirement       ProjectRequirement?
+  researchPlans     ResearchPlan[]
+  researchRuns      ResearchRun[]
+  sources           Source[]
+  evidence          Evidence[]
+  claims            Claim[]
+  researchGaps      ResearchGap[]
+  researchConflicts ResearchConflict[]
+  notes             Note[]
+  outlines          Outline[]
+  documents         Document[]
+  references        Reference[]
+  files             File[]
+  exports           Export[]
+  usageRecords      UsageRecord[]
+  reviews           Review[]
+
+  @@index([ownerId, status])
+}
+
+model ProjectRequirement {
+  id                     String    @id @default(cuid())
+  projectId              String    @unique
+  topic                  String
+  researchQuestions      Json?
+  researchArea           String?
+  population              String?
+  geographicFocus        String?
+  academicLevel          String?
+  discipline             String?
+  deliverableType        String?
+  citationStyle          String?
+  wordCount              Int?
+  pageCount              Int?
+  deadline               DateTime?
+  institution            String?
+  department              String?
+  researchStartDate      DateTime?
+  researchEndDate        DateTime?
+  additionalRequirements Json?
+  version                Int       @default(1)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model ResearchPlan {
+  id                    String   @id @default(cuid())
+  projectId             String
+  version               Int
+  status                String
+  mainQuestion          String?
+  subQuestions          Json?
+  keywords              Json?
+  searchConcepts        Json?
+  sourceTypes           Json?
+  inclusionCriteria     Json?
+  exclusionCriteria     Json?
+  geographicConstraints Json?
+  dateConstraints       Json?
+  evidenceCategories    Json?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  researchRuns ResearchRun[]
+
+  @@unique([projectId, version])
+  @@index([projectId])
+}
+
+model ResearchRun {
+  id             String            @id @default(cuid())
+  projectId      String
+  researchPlanId String
+  status         ResearchRunStatus @default(QUEUED)
+  startedAt      DateTime?
+  completedAt    DateTime?
+  failedAt       DateTime?
+  errorCode      String?
+  errorMessage   String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  project      Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  researchPlan ResearchPlan       @relation(fields: [researchPlanId], references: [id])
+  events       ResearchRunEvent[]
+  sources      Source[]
+  evidence     Evidence[]
+  claims       Claim[]
+  gaps         ResearchGap[]
+  conflicts    ResearchConflict[]
+
+  @@index([projectId, status])
+}
+
+model ResearchRunEvent {
+  id            String   @id @default(cuid())
+  researchRunId String
+  type          String
+  status        String?
+  message       String
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  researchRun ResearchRun @relation(fields: [researchRunId], references: [id], onDelete: Cascade)
+
+  @@index([researchRunId, createdAt])
+}
+
+model Source {
+  id               String                 @id @default(cuid())
+  projectId        String
+  researchRunId    String?
+  provider         SourceProvider?
+  title            String
+  authors          Json?
+  publicationDate  DateTime?
+  publisher        String?
+  journal          String?
+  url              String?
+  doi              String?
+  sourceType       SourceType
+  abstract         String?
+  language         String?
+  metadata         Json?
+  relevanceScore   Float?
+  authoritySignals Json?
+  evaluationStatus SourceEvaluationStatus @default(PENDING)
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  researchRun ResearchRun?    @relation(fields: [researchRunId], references: [id], onDelete: SetNull)
+  document    SourceDocument?
+  evidence    Evidence[]
+  references  Reference[]
+
+  @@index([projectId])
+  @@index([researchRunId])
+}
+
+model SourceDocument {
+  id             String               @id @default(cuid())
+  sourceId       String               @unique
+  status         SourceDocumentStatus @default(PENDING)
+  retrievedUrl   String?
+  httpStatus     Int?
+  // Reserved for a future raw-file (Files/S3) slice — unused in Slice 2.
+  storageKey     String?
+  mimeType       String?
+  fileSize       Int?
+  checksum       String?
+  // Opaque key into the SourceDocumentStorage abstraction (see
+  // infrastructure/content/). For Slice 2's Postgres implementation this
+  // is the owning Source's id, looked up in SourceDocumentText.
+  textStorageKey String?
+  errorMessage   String?
+  extractedAt    DateTime?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  source Source @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+}
+
+// Postgres-backed SourceDocumentStorage implementation. See schema header note 7.
+model SourceDocumentText {
+  key       String   @id
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Evidence {
+  id            String       @id @default(cuid())
+  projectId     String
+  sourceId      String
+  researchRunId String?
+  type          EvidenceType
+  content       String
+  context       String?
+  location      Json?
+  limitations   String?
+  confidence    Float?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source      Source          @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  researchRun ResearchRun?    @relation(fields: [researchRunId], references: [id], onDelete: SetNull)
+  claims      ClaimEvidence[]
+  conflicts   ConflictEvidence[]
+
+  @@index([projectId])
+  @@index([sourceId])
+}
+
+model Claim {
+  id            String      @id @default(cuid())
+  projectId     String
+  researchRunId String?
+  statement     String
+  claimType     String?
+  status        ClaimStatus
+  confidence    Float?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  researchRun ResearchRun?    @relation(fields: [researchRunId], references: [id], onDelete: SetNull)
+  evidence    ClaimEvidence[]
+
+  @@index([projectId, status])
+}
+
+model ClaimEvidence {
+  claimId      String
+  evidenceId   String
+  relationship ClaimEvidenceRelationship
+  createdAt    DateTime                  @default(now())
+
+  claim    Claim    @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  evidence Evidence @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  @@id([claimId, evidenceId])
+}
+
+model ResearchGap {
+  id            String   @id @default(cuid())
+  projectId     String
+  researchRunId String?
+  type          String
+  description   String
+  scope         String?
+  evidence      String?
+  confidence    Float?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  researchRun ResearchRun? @relation(fields: [researchRunId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+}
+
+model ResearchConflict {
+  id               String   @id @default(cuid())
+  projectId        String
+  researchRunId    String?
+  description      String
+  context          String?
+  resolutionStatus String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  project     Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  researchRun ResearchRun?       @relation(fields: [researchRunId], references: [id], onDelete: SetNull)
+  evidence    ConflictEvidence[]
+
+  @@index([projectId])
+}
+
+// Which Evidence rows a ResearchConflict is between. See schema header note 8.
+model ConflictEvidence {
+  conflictId String
+  evidenceId String
+  createdAt  DateTime @default(now())
+
+  conflict ResearchConflict @relation(fields: [conflictId], references: [id], onDelete: Cascade)
+  evidence Evidence         @relation(fields: [evidenceId], references: [id], onDelete: Cascade)
+
+  @@id([conflictId, evidenceId])
+}
+
+model Note {
+  id        String   @id @default(cuid())
+  projectId String
+  title     String
+  content   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Outline {
+  id        String   @id @default(cuid())
+  projectId String
+  version   Int
+  title     String
+  structure Json
+  status    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, version])
+  @@index([projectId])
+}
+
+model Document {
+  id     String         @id @default(cuid())
+  projectId String
+  title     String
+  type      DocumentType
+  status    DocumentStatus @default(DRAFT)
+  // Unenforced pointer to the "current" version — see file header note 3.
+  currentVersionId String?        @unique
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  project  Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  versions DocumentVersion[]
+  exports  Export[]
+
+  @@index([projectId])
+}
+
+model DocumentVersion {
+  id                String   @id @default(cuid())
+  documentId        String
+  versionNumber     Int
+  content           Json
+  // Bare field, not a User relation — see file header note 4.
+  createdBy         String
+  generationSource  String?
+  createdAt         DateTime @default(now())
+
+  document  Document   @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  citations Citation[]
+  reviews   Review[]
+  exports   Export[]
+
+  @@unique([documentId, versionNumber])
+}
+
+model Reference {
+  id        String   @id @default(cuid())
+  projectId String
+  sourceId  String?
+  type      String
+  title     String
+  authors   Json?
+  year      Int?
+  publisher String?
+  journal   String?
+  volume    String?
+  issue     String?
+  pages     String?
+  doi       String?
+  url       String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source    Source?    @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  citations Citation[]
+
+  @@index([projectId])
+}
+
+model Citation {
+  id                String   @id @default(cuid())
+  documentVersionId String
+  referenceId       String
+  location          Json?
+  citationText      String
+  style             String
+  createdAt         DateTime @default(now())
+
+  documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id], onDelete: Cascade)
+  reference       Reference       @relation(fields: [referenceId], references: [id], onDelete: Cascade)
+
+  @@index([documentVersionId])
+}
+
+model Review {
+  id                String       @id @default(cuid())
+  projectId         String
+  documentVersionId String
+  type              ReviewType
+  status            ReviewStatus @default(QUEUED)
+  summary           String?
+  createdAt         DateTime     @default(now())
+  completedAt       DateTime?
+
+  project         Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id], onDelete: Cascade)
+  findings        ReviewFinding[]
+
+  @@index([projectId])
+}
+
+model ReviewFinding {
+  id         String          @id @default(cuid())
+  reviewId   String
+  type       String
+  severity   FindingSeverity
+  location   Json?
+  message    String
+  suggestion String?
+  status     FindingStatus   @default(OPEN)
+  createdAt  DateTime        @default(now())
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@index([reviewId, status])
+}
+
+model File {
+  id               String     @id @default(cuid())
+  projectId        String
+  uploadedBy       String
+  filename         String
+  mimeType         String
+  size             Int
+  storageKey       String
+  checksum         String
+  uploadStatus     FileStatus @default(UPLOADED)
+  processingStatus FileStatus @default(UPLOADED)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  project  Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  uploader User    @relation(fields: [uploadedBy], references: [id])
+
+  @@index([projectId])
+}
+
+model Export {
+  id                String       @id @default(cuid())
+  projectId         String
+  documentId        String
+  documentVersionId String
+  format            ExportFormat
+  status            ExportStatus @default(QUEUED)
+  storageKey        String?
+  errorMessage      String?
+  createdAt         DateTime     @default(now())
+  completedAt       DateTime?
+
+  // FIX (note 1 above): Document.exports expects this back-relation.
+  project         Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  document        Document        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id])
+
+  @@index([projectId])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  type      String
+  title     String
+  message   String
+  readAt    DateTime?
+  metadata  Json?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
